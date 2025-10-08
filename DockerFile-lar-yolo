@@ -1,0 +1,224 @@
+FROM nvidia/cuda:11.1.1-cudnn8-devel-ubuntu18.04
+
+ENV DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+# Sistema + Python + libs necessárias para OpenCV headless
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.8 python3.8-distutils python3.8-dev \
+    git curl ca-certificates tzdata \
+    libgl1 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
+
+# pip para Python 3.8
+RUN curl -sS https://bootstrap.pypa.io/pip/3.8/get-pip.py -o /tmp/get-pip.py && \
+    python3.8 /tmp/get-pip.py && rm -f /tmp/get-pip.py
+
+# PyTorch 1.8.1 + cu111 (compatível com a base CUDA 11.1)
+RUN python3.8 -m pip install --no-cache-dir \
+    "torch==1.8.1+cu111" "torchvision==0.9.1+cu111" \
+    -f https://download.pytorch.org/whl/torch_stable.html
+
+# Ferramentas base
+RUN python3.8 -m pip install --no-cache-dir -U pip setuptools wheel
+
+# Dependências científicas e Ultralytics (OpenCV headless)
+RUN python3.8 -m pip install --no-cache-dir \
+    numpy==1.23.5 \
+    timm==0.6.13 einops==0.7.0 thop==0.1.1.post2209072238 \
+    matplotlib==3.7.3 pillow==9.5.0 pyyaml==6.0.1 pandas==1.3.5 seaborn==0.12.2 \
+    ultralytics==8.0.221 opencv-python-headless==4.7.0.72
+
+# Workspace e repo
+WORKDIR /home/jonasvm/lar-yolo
+RUN git clone https://github.com/Yihao1998/LAR-YOLOv8.git
+ENV PYTHONPATH=/home/jonasvm/lar-yolo/LAR-YOLOv8
+
+# Grava o runner usando o próprio Python (evita bugs de shell/heredoc)
+RUN python3.8 - <<'PY' && chmod +x /usr/local/bin/run_experiment.py
+script = r"""
+from pathlib import Path
+import os, sys, importlib, types, pathlib
+import torch, torch.nn as nn
+
+repo = Path("/home/jonasvm/lar-yolo/LAR-YOLOv8")
+os.chdir(repo); sys.path.append(str(repo))
+
+# ----------------- SHIMS -----------------
+ultra_nn_modules = importlib.import_module("ultralytics.nn.modules")
+sys.modules.setdefault("ultralytics.nn.extra_modules", ultra_nn_modules)
+
+U = importlib.import_module("ultralytics.utils")
+yolo_pkg = types.ModuleType("ultralytics.yolo")
+yolo_utils = types.ModuleType("ultralytics.yolo.utils")
+def _copy(name, default=None):
+    if hasattr(U, name): setattr(yolo_utils, name, getattr(U, name))
+    elif default is not None: setattr(yolo_utils, name, default)
+for _n in ["DEFAULT_CFG_DICT","DEFAULT_CFG_KEYS","DEFAULT_CFG","LOGGER","colorstr","emojis","yaml_load","ROOT","RANK","RUNS_DIR"]:
+    _copy(_n, {} if "CFG" in _n else None)
+sys.modules["ultralytics.yolo"] = yolo_pkg
+sys.modules["ultralytics.yolo.utils"] = yolo_utils
+setattr(yolo_pkg, "utils", yolo_utils)
+sys.modules["ultralytics.yolo.utils.checks"] = importlib.import_module("ultralytics.utils.checks")
+sys.modules["ultralytics.yolo.utils.loss"] = importlib.import_module("ultralytics.utils.loss")
+sys.modules["ultralytics.yolo.utils.torch_utils"] = importlib.import_module("ultralytics.utils.torch_utils")
+sys.modules["ultralytics.yolo.utils.ops"] = importlib.import_module("ultralytics.utils.ops")
+sys.modules["ultralytics.yolo.utils.plotting"] = importlib.import_module("ultralytics.utils.plotting")
+
+# --- shim extra: downloads.attempt_download_asset ---
+yolo_downloads = types.ModuleType("ultralytics.yolo.utils.downloads")
+try:
+    from ultralytics.utils.downloads import attempt_download as _attempt_download
+    def attempt_download_asset(x, *a, **k):
+        try:
+            return _attempt_download(x)
+        except Exception:
+            return x
+except Exception:
+    def attempt_download_asset(x, *a, **k): return x
+setattr(yolo_downloads, "attempt_download_asset", attempt_download_asset)
+sys.modules["ultralytics.yolo.utils.downloads"] = yolo_downloads
+
+from ultralytics import YOLO
+ultra_tasks = importlib.import_module("ultralytics.nn.tasks")
+ultra_modules = importlib.import_module("ultralytics.nn.modules")
+ultra_engine_model = importlib.import_module("ultralytics.engine.model")
+
+lar_tasks = importlib.import_module("tasks")
+try:
+    lar_loss = importlib.import_module("loss")
+except Exception:
+    lar_loss = None
+
+for _pkg in ("Attention", "Transformer"):
+    try: importlib.import_module(_pkg)
+    except Exception: pass
+
+# -------- fallbacks de blocos --------
+if not hasattr(lar_tasks, "C2f_CloAtt"):
+    class C2f_CloAtt(ultra_modules.C2f): pass
+    setattr(lar_tasks, "C2f_CloAtt", C2f_CloAtt)
+
+class _Align1x1(nn.Module):
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        self.conv = nn.Conv2d(c_in, c_out, 1, 1, 0, bias=False)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.act = nn.SiLU(True)
+    def forward(self, x): return self.act(self.bn(self.conv(x)))
+
+if not hasattr(lar_tasks, "Fusion"):
+    class Fusion(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__(); self.align = None
+        def _build(self, xs):
+            c_out = xs[-1].shape[1]
+            self.align = nn.ModuleList([nn.Identity() if t.shape[1]==c_out else _Align1x1(t.shape[1], c_out) for t in xs])
+        def forward(self, x):
+            if isinstance(x, (list, tuple)):
+                xs = list(x)
+                if self.align is None: self._build(xs)
+                ys = [m(t) for m,t in zip(self.align, xs)]
+                return torch.stack(ys).sum(0)
+            return x
+    setattr(lar_tasks, "Fusion", Fusion)
+
+if not hasattr(lar_tasks, "BiLevelRoutingAttention"):
+    class BiLevelRoutingAttention(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__(); self.id = nn.Identity()
+        def forward(self, x): return x
+    setattr(lar_tasks, "BiLevelRoutingAttention", BiLevelRoutingAttention)
+
+# injeta tasks/loss nos namespaces do Ultralytics
+def inject(ns_src, ns_targets):
+    for name, obj in ns_src.__dict__.items():
+        if name.startswith("_"): continue
+        for ns in ns_targets: setattr(ns, name, obj)
+inject(lar_tasks, [ultra_tasks, ultra_modules])
+if lar_loss is not None: inject(lar_loss, [ultra_tasks, ultra_modules])
+
+print("="*70)
+print(f"Torch {torch.__version__} | CUDA {torch.version.cuda} | GPU? {torch.cuda.is_available()}")
+print("="*70)
+
+# -------- desativa QUALQUER salvamento de checkpoint (HARD) --------
+try:
+    import ultralytics.utils.patches as _patches
+    _patches._torch_save = lambda *a, **k: None
+    _patches.torch_save = lambda *a, **k: None
+except Exception:
+    pass
+import torch as _t
+try:
+    import torch.serialization as _ts
+    _ts.save = lambda *a, **k: None
+except Exception:
+    pass
+_t.save = lambda *a, **k: None
+try:
+    import ultralytics.engine.trainer as _utr
+    _utr.torch = _t
+except Exception:
+    pass
+
+# -------- desativa AMP para não tentar baixar yolov8n.pt --------
+try:
+    import ultralytics.utils.checks as _checks
+    _checks.check_amp = lambda *a, **k: False
+except Exception:
+    pass
+
+cfg = repo / "yolov8-LAR.yaml"
+assert cfg.exists(), f"yolov8-LAR.yaml não encontrado em {cfg}"
+device = "0" if torch.cuda.is_available() else "cpu"
+outdir = repo / "runs_auto"
+outdir.mkdir(exist_ok=True)
+
+print("==> Treinando (coco8, 30 épocas)…")
+m = YOLO(str(cfg))
+
+# --- PATCHES de reload de checkpoint ---
+def _torch_safe_load_noop(file, *a, **k):
+    return ({"train_args": {}}, file)
+ultra_tasks.torch_safe_load = _torch_safe_load_noop
+
+def _attempt_load_one_weight_patched(weight, *a, **k):
+    p = pathlib.Path(weight) if isinstance(weight, (str, pathlib.Path)) else None
+    if p is None or not p.exists():
+        return (m.model, None)
+    try:
+        orig = importlib.import_module("ultralytics.nn.tasks").__dict__.get("attempt_load_one_weight_orig")
+        if callable(orig):
+            return orig(weight, *a, **k)
+    except Exception:
+        pass
+    return (m.model, None)
+
+if "attempt_load_one_weight_orig" not in ultra_tasks.__dict__:
+    ultra_tasks.attempt_load_one_weight_orig = getattr(ultra_tasks, "attempt_load_one_weight", None)
+ultra_tasks.attempt_load_one_weight = _attempt_load_one_weight_patched
+ultra_engine_model.attempt_load_one_weight = _attempt_load_one_weight_patched
+
+# roda treino (amp=False)
+res = m.train(data="coco8.yaml", epochs=30, imgsz=640, batch=8, workers=2,
+             device=device, project=str(outdir), name="train_coco8", exist_ok=True,
+             save=False, plots=False, val=False, amp=False)
+print("Treino concluído (sem salvar checkpoint).")
+
+print("==> Inferência de teste…")
+# ⚠️ Normaliza overrides para dict antes de chamar predict (evita TypeError)
+try:
+    if not isinstance(m.overrides, dict):
+        m.overrides = dict(getattr(m.overrides, "__dict__", {}))
+except Exception:
+    m.overrides = {}
+
+pred = m.predict(source="https://ultralytics.com/images/bus.jpg", imgsz=640, conf=0.25,
+                save=True, project=str(outdir), name="predict_coco8", exist_ok=True, device=device)
+print("Inferência salva em:", pred[0].save_dir)
+"""
+open('/usr/local/bin/run_experiment.py','w',encoding='utf-8').write(script)
+PY
+
+ENTRYPOINT ["python3.8", "/usr/local/bin/run_experiment.py"]
